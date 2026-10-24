@@ -142,7 +142,7 @@ let bgCanvas = null;
 let sendToHost = () => {};
 let mapWalls = [];
 let miniBase = null;
-let bossS = null, bossFlash = 0, prevBossHp = 0, myRs = 0, isHost = false, banner = { text: '', until: 0 }, speech = { text: '', until: 0 };
+let BOTS = [], bossS = null, bossFlash = 0, prevBossHp = 0, myRs = 0, isHost = false, banner = { text: '', until: 0 }, speech = { text: '', until: 0 };
 let mp = null, acc = 0, lastT = performance.now(), lastMv = { mx: 0, my: 0 };   // predicted self
 let BM = {};          // tracked bullets by id
 let parts = [];       // spark particles
@@ -179,6 +179,200 @@ function sfx(kind, vol) {
   else if (kind === 'hit') { out.gain.value = 0.7 * vol; noise(0.14, 'bandpass', 2500, 0.9); tone('triangle', 420, 70, 0.14, 0.6); }
   else if (kind === 'die') { out.gain.value = 0.8 * vol; noise(0.5, 'lowpass', 900, 1); tone('sawtooth', 200, 35, 0.45, 0.6); }
   else if (kind === 'boss') { out.gain.value = 0.9; noise(0.9, 'lowpass', 500, 1); tone('sawtooth', 110, 38, 0.9, 0.7); }
+  else if (kind === 'growl') { out.gain.value = 0.45; noise(0.35, 'lowpass', 400, 0.9); tone('sawtooth', 150, 65, 0.35, 0.5); }
+  else if (kind === 'clang') { out.gain.value = 0.4 * vol; tone('square', 1900, 900, 0.07, 0.4); noise(0.06, 'highpass', 4000, 0.5); }
+  else if (kind === 'win') { out.gain.value = 0.7; tone('triangle', 300, 900, 0.5, 0.6); noise(0.3, 'highpass', 3000, 0.4); }
+}
+function vol(x, y) {
+  const me = P[myId]; if (!me) return 1;
+  return Math.max(0.08, 1 - Math.hypot(x - me.x, y - me.y) / 900);
+}
+
+// ---------- sparks ----------
+function spark(x, y, ang, spread, n, speed, life, color) {
+  for (let i = 0; i < n; i++) {
+    const a = ang + (Math.random() - .5) * spread, v = speed * (0.35 + Math.random() * 0.65);
+    parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: life * (0.6 + Math.random() * 0.6), max: life, c: Math.random() < .4 ? '#fff6c8' : color });
+  }
+  if (parts.length > 250) parts.splice(0, parts.length - 250);
+}
+
+function makeBg() {
+  bgCanvas = document.createElement('canvas');
+  bgCanvas.width = W; bgCanvas.height = H;
+  const g = bgCanvas.getContext('2d');
+  g.fillStyle = '#02040a'; g.fillRect(0, 0, W, H);
+  const blobs = [
+    [300, 250, 560, '30,90,255', .60],
+    [1250, 200, 460, '0,160,255', .42],
+    [800, 800, 620, '20,60,200', .55],
+    [1500, 850, 420, '70,40,220', .38],
+    [120, 900, 440, '0,120,255', .38]
+  ];
+  const sx = W / 1600;
+  for (const [bx, by, br, rgb, a] of blobs) {
+    const x = bx * sx, y = by * sx, r = br * sx;
+    const gr = g.createRadialGradient(x, y, 0, x, y, r);
+    gr.addColorStop(0, 'rgba(' + rgb + ',' + a + ')');
+    gr.addColorStop(1, 'rgba(' + rgb + ',0)');
+    g.fillStyle = gr; g.fillRect(0, 0, W, H);
+  }
+  g.strokeStyle = 'rgba(140,180,255,.06)'; g.lineWidth = 1;
+  g.beginPath();
+  for (let x = 0; x <= W; x += 80) { g.moveTo(x, 0); g.lineTo(x, H); }
+  for (let y = 0; y <= H; y += 80) { g.moveTo(0, y); g.lineTo(W, y); }
+  g.stroke();
+  g.strokeStyle = 'rgba(120,170,255,.5)'; g.lineWidth = 4; g.strokeRect(0, 0, W, H);
+  g.shadowColor = '#5dc8ff'; g.shadowBlur = 14;   // barricades
+  for (const w of mapWalls) {
+    g.fillStyle = '#0e1d44'; g.fillRect(w.x, w.y, w.w, w.h);
+    g.strokeStyle = 'rgba(93,200,255,.9)'; g.lineWidth = 3; g.strokeRect(w.x, w.y, w.w, w.h);
+  }
+  g.shadowBlur = 0;
+}
+
+function resize() {
+  const d = Math.min(window.devicePixelRatio || 1, 1.5);
+  cv.width = innerWidth * d; cv.height = innerHeight * d;
+}
+addEventListener('resize', resize); resize();
+
+function showMsg(t) { document.getElementById('msgText').textContent = t; document.getElementById('msg').style.display = 'flex'; }
+
+// Handles every message the (host) game sends to this player.
+function handle(m) {
+  if (m.t === 'welcome') {
+    myId = m.id; W = m.W; H = m.H; MIN_RANGE = m.minRange; MAX_RANGE = m.maxRange; mapWalls = m.walls || [];
+    mp = null; makeBg(); makeMini(); playing = true;
+    document.getElementById('menu').style.display = 'none';
+    if (isHost) bossBtn.style.display = 'block';
+    if (document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(() => {});
+  } else if (m.t === 'roster') {
+    roster = {}; m.list.forEach(p => roster[p.id] = p);
+    for (const id in P) if (!roster[id]) delete P[id];
+  } else if (m.t === 's') {
+    for (const a of m.p) {
+      const [id, x, y, hp, alive, aim, score, rs] = a;
+      const p = P[id] || (P[id] = { x, y });
+      if (p.alive === 1 && alive === 0) {
+        const c = roster[id] ? roster[id].color : '#fff';
+        spark(x, y, 0, Math.PI * 2, 24, 420, 36, c); sfx('die', vol(x, y));
+      }
+      p.tx = x; p.ty = y; p.hp = hp; p.alive = alive; p.aim = aim; p.score = score;
+      if (+id === myId) {   // I move myself; the host's position only matters on (re)spawn
+        if (!alive) mp = null;
+        else if (!mp || rs !== myRs) mp = { x, y, vx: 0, vy: 0 };
+        myRs = rs;
+      }
+    }
+    B = m.b; BOTS = m.k || [];
+    bossS = m.bs || null;
+    if (bossS) { if (bossS[2] < prevBossHp) bossFlash = 5; prevBossHp = bossS[2]; } else prevBossHp = 0;
+    if (isHost) { const t = bossS ? 'Dismiss Red Eye' : 'Summon Red Eye'; if (bossBtn.textContent !== t) bossBtn.textContent = t; }
+    const seen = {};
+    for (const b of B) {
+      const id = b[3]; seen[id] = 1;
+      const o = BM[id];
+      if (!o) {
+        const own = P[b[2]], r = roster[b[2]], col = r ? r.color : (o && o.o === 0 ? '#ff4d6d' : '#ffd36b');
+        const ang = own ? own.aim : Math.random() * 6.28;
+        const bv = b.length > 4;
+        BM[id] = { x: b[0], y: b[1], px: b[0] - (bv ? b[4] * 0.03 : Math.cos(ang) * 20), py: b[1] - (bv ? b[5] * 0.03 : Math.sin(ang) * 20), o: b[2], vx: bv ? b[4] : Math.cos(ang) * BULLET_SPEED, vy: bv ? b[5] : Math.sin(ang) * BULLET_SPEED, t: performance.now() };
+        if (b[2] !== 0) { spark(b[0], b[1], ang, 0.9, 6, 380, 14, col); sfx('shot', vol(b[0], b[1])); }   // muzzle flash
+      } else { o.px = o.x; o.py = o.y; o.x = b[0]; o.y = b[1]; o.t = performance.now(); }
+    }
+    for (const id in BM) {
+      if (seen[id]) continue;
+      const o = BM[id]; delete BM[id];
+      const r = roster[o.o], col = r ? r.color : (o && o.o === 0 ? '#ff4d6d' : '#ffd36b');
+      let hitP = !!(bossS && o.o !== 0 && Math.abs(o.x - bossS[0]) < 125 && Math.abs(o.y - bossS[1]) < 125);
+      for (const pid in P) { const q = P[pid]; if (q.alive && +pid !== o.o && (!bossS || o.o === 0) && Math.hypot(q.tx - o.x, q.ty - o.y) < 34) hitP = true; }
+      const back = Math.atan2(o.py - o.y, o.px - o.x);
+      let clang = false;
+      if (bossS && bossS[5] === 2 && o.o !== 0) {   // bounced off a side shield
+        const l = bossLocal(o.x, o.y);
+        clang = Math.abs(l[0]) < 135 && Math.abs(l[1]) > 100 && Math.abs(l[1]) < 175;
+      }
+      if (clang) { spark(o.x, o.y, back, 2, 8, 260, 14, '#9fe3ff'); sfx('clang', vol(o.x, o.y)); }
+      else {
+        spark(o.x, o.y, back, hitP ? 2.6 : 1.8, hitP ? 14 : 5, hitP ? 320 : 200, hitP ? 24 : 14, col);
+        if (hitP) sfx('hit', vol(o.x, o.y));
+      }
+    }
+  } else if (m.t === 'ev') {
+    const now = performance.now();
+    if (m.k === 'spawn') { banner = { text: 'RED EYE AWAKENS!', until: now + 3200 }; sfx('boss', 1); }
+    else if (m.k === 'evolve') { banner = { text: 'RED EYE EVOLVES!', until: now + 3400 }; sfx('boss', 1); }
+    else if (m.k === 'win') { banner = { text: 'RED EYE DEFEATED!', until: now + 3200 }; sfx('win', 1); }
+    else if (m.k === 'swarm') banner = { text: 'RED EYE RELEASES HIS BOTS!', until: now + 3400 };
+    else if (m.k === 'gone') banner = { text: 'Red Eye dismissed', until: now + 1800 };
+    else if (m.k === 'say') { speech = { text: String(m.text).slice(0, 90), until: now + 4500 }; sfx('growl', 1); }
+  } else if (m.t === 'full') {
+    showMsg('Game is full (8 players max)');
+  }
+}
+
+// ---------- JOIN (client) ----------
+document.getElementById('join').onclick = () => {
+  const name = getName();
+  const code = document.getElementById('room').value.trim().toUpperCase();
+  if (!code) return setStatus('Enter a room code first');
+  audio(); roomCode = code; setButtons(true); setStatus('Connecting…');
+  const peer = new Peer();
+  const timeout = setTimeout(() => { if (!playing) { setStatus('Could not connect. Check the code.'); setButtons(false); peer.destroy(); } }, 12000);
+  peer.on('open', () => {
+    const conn = peer.connect('shapeshooter-' + code, { serialization: 'json' });
+    conn.on('open', () => {
+      sendToHost = m => { if (conn.open) conn.send(m); };
+      sendToHost({ t: 'join', name, shape: chosenShape, color: chosenColor });
+    });
+    conn.on('data', handle);
+    conn.on('close', () => { clearTimeout(timeout); showMsg('Host left the game'); });
+    conn.on('error', () => { setStatus('Connection error'); setButtons(false); });
+  });
+  peer.on('error', e => {
+    clearTimeout(timeout);
+    if (!playing) { setStatus(e.type === 'peer-unavailable' ? 'No room with that code' : 'Network error, try again'); setButtons(false); }
+  });
+};
+
+// ---------- HOST (the old server.js, now running in this browser) ----------
+const RADIUS = 18, SPEED = 560, ACCEL_RATE = 14, FRICTION_RATE = 3, BULLET_SPEED = 1000, DAMAGE = 20, FIRE_DELAY = 0.25, RESPAWN = 2, MAX_PLAYERS = 8, TICK = 1 / 60;
+const SERVER_MIN_RANGE = 60, SERVER_MAX_RANGE = 520, ARENA_W = 3200, ARENA_H = 2000;
+const players = new Map();
+let bullets = [], nextId = 1, nextBid = 1, tickN = 0;
+
+// Barricades: one quarter of the map, mirrored into all four corners
+const CLEAR = { x: 1200, y: 600, w: 800, h: 800 };   // empty zone in the middle: no barricades
+const WALLS = [];
+(function () {
+  const q = [
+    [300, 250, 260, 40], [300, 250, 40, 240],
+    [800, 180, 40, 260], [1000, 520, 260, 40],
+    [520, 720, 40, 240], [620, 880, 280, 40],
+    [1300, 300, 180, 40], [1250, 760, 40, 180],
+    [1500, 940, 200, 40], [1000, 120, 160, 40], [150, 600, 160, 40]
+  ];
+  const seen = new Set();
+  for (const [x, y, w, h] of q) for (const mx of [0, 1]) for (const my of [0, 1]) {
+    const wx = mx ? ARENA_W - x - w : x, wy = my ? ARENA_H - y - h : y, key = wx + ',' + wy;
+    if (wx < CLEAR.x + CLEAR.w && wx + w > CLEAR.x && wy < CLEAR.y + CLEAR.h && wy + h > CLEAR.y) continue;
+    if (seen.has(key)) continue; seen.add(key);
+    WALLS.push({ x: wx, y: wy, w, h });
+  }
+})();
+
+function inWall(x, y, pad) {
+  for (const w of WALLS) if (x > w.x - pad && x < w.x + w.w + pad && y > w.y - pad && y < w.y + w.h + pad) return true;
+  return false;
+}
+// ---- Giant Square boss ----
+const BOSS_HALF = 110, BOSS_DMG = 15, BOSS_CONTACT = 25, SHIELD_T = 25;
+const TAUNTS = {
+  hunt: ["{n}, I will hunt you down and rip you apart in the dark.", "Keep shooting, {n}. I will remember your face.", "{n}... I can already hear you begging.", "Is that all you have, {n}?"],
+  kill: ["Pathetic, {n}.", "{n} fell so easily.", "One less to hunt."],
+  idle: ["Run. It only makes this more fun.", "I can smell your fear.", "You are all just noise to me."],
+  ev); tone('sawtooth', 110, 38, 0.9, 0.7); }
   else if (kind === 'growl') { out.gain.value = 0.45; noise(0.35, 'lowpass', 400, 0.9); tone('sawtooth', 150, 65, 0.35, 0.5); }
   else if (kind === 'clang') { out.gain.value = 0.4 * vol; tone('square', 1900, 900, 0.07, 0.4); noise(0.06, 'highpass', 4000, 0.5); }
   else if (kind === 'win') { out.gain.value = 0.7; tone('triangle', 300, 900, 0.5, 0.6); noise(0.3, 'highpass', 3000, 0.4); }
